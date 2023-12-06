@@ -9,6 +9,13 @@ cortex-m = "0.7"
 cortex-m-rt = "0.7"
 panic-halt = "0.2.0"
 
+embedded-graphics = "0.8.1"
+ssd1306 = "0.8.4"
+
+[dependencies.time]
+version = "0.3.30"
+default-features = false
+features = ["macros"]
 
 [dependencies.stm32f4xx-hal]
 version = "0.17.1"

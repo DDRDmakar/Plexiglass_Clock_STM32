@@ -8,180 +8,175 @@
 // Halt on panic
 use panic_halt as _;
 
+use core::str;
+use core::fmt::Write;
 
 use cortex_m_rt::entry;
 use stm32f4xx_hal::{
-	gpio::{self, Edge},
-    pac,
     prelude::*,
-	pac::{interrupt, Interrupt, TIM2},
-	timer::{CounterUs, Event},
+	gpio::Edge,
+	timer::Event,
 	i2c::{I2c, Mode},
-	serial
+	rtc::Rtc,
+    pac,
+	serial,
 };
-use core::cell::RefCell;
-use core::fmt::Write;
-use cortex_m::interrupt::Mutex;
+
+use ssd1306::{prelude::*, I2CDisplayInterface, Ssd1306};
+use embedded_graphics::{
+    prelude::*,
+    pixelcolor::BinaryColor,
+	text::Text,
+	mono_font::{
+		MonoTextStyle,
+		iso_8859_5::{FONT_10X20, FONT_6X10},
+	},
+};
+
+use time::{
+    macros::{date, time},
+    PrimitiveDateTime,
+};
+
+mod util;
+mod irq;
+use crate::util::*;
+use crate::irq::*;
 
 
-// Globally available struct to work with interrupts
-static G_REGS: Mutex<RefCell<Option<u8>>> = Mutex::new(RefCell::new(None));
-
-// Make timer interrupt registers globally available
-static G_TIM: Mutex<RefCell<Option<CounterUs<TIM2>>>> = Mutex::new(RefCell::new(None));
-
-static G_BUT: Mutex<RefCell<Option<gpio::gpioa::PA0>>> = Mutex::new(RefCell::new(None));
-
-#[allow(clippy::empty_loop)]
 #[entry]
 fn main() -> ! {
-	let (Some(mut dp), Some(cp)) = (
-        pac::Peripherals::take(),
-        cortex_m::peripheral::Peripherals::take(),
-    ) else { todo!() } ;
-
-    let gpioa = dp.GPIOA.split();
-	let gpiob = dp.GPIOB.split();
-    let gpioc = dp.GPIOC.split();
-    let mut led = gpioc.pc13.into_push_pull_output();
-	let mut but = gpioa.pa0.into_pull_up_input();
-
-	let regs: u8 = 0x55;
-	cortex_m::interrupt::free(|cs| *G_REGS.borrow(cs).borrow_mut() = Some(regs));
+	//-------- Peripherals handler
+	let mut dp = pac::Peripherals::take().unwrap();
+	//let cp = cortex_m::peripheral::Peripherals::take().unwrap();
 
 	let rcc = dp.RCC.constrain();
+	let mut syscfg = dp.SYSCFG.constrain();
+	
+	//-------- Clocks
     let clocks = rcc.cfgr
 		.use_hse(25.MHz()) // Using the high-speed external oscillator
 		.hclk(50.MHz()) // Set the frequency for the AHB bus, which the root of every following clock peripheral
-		.sysclk(50.MHz())
+		.sysclk(50.MHz()) // System clock
 		.pclk1(25.MHz()) // Peripheral clocks
 		.pclk2(25.MHz()) // Peripheral clocks
 		.freeze();
-	//let clocks = rcc.cfgr.sysclk(48.MHz()).freeze();
-	let mut timer = dp.TIM2.counter(&clocks);
-    timer.start(1.secs()).unwrap();
+	
+	//-------- Timers
+	let mut timer2 = dp.TIM2.counter(&clocks);
+    timer2.start(1.secs()).unwrap();
+	timer2.listen(Event::Update);
+	
+	//let mut delay_sys = cp.SYST.delay(&clocks);
+	//let mut delay_t4 = dp.TIM4.delay_us(&clocks);
+	let mut delay_t5 = dp.TIM5.delay_us(&clocks);
 
-	timer.listen(Event::Update);
 
+	//-------- RTC
+	let mut rtc = Rtc::new(dp.RTC, &mut dp.PWR);
+	
+	rtc.set_datetime(&PrimitiveDateTime::new(
+        date!(1970 - 01 - 01),
+        time!(23:59:50),
+    )).unwrap();
+	
+	//-------- GPIO
+	let gpioa = dp.GPIOA.split();
+	let gpiob = dp.GPIOB.split();
+    let gpioc = dp.GPIOC.split();
 
+    let mut led = gpioc.pc13.into_push_pull_output(); // Led in the module
+	let mut but = gpioa.pa0.into_pull_up_input(); // Button on the module
 
-	//let mut delay = cp.SYST.delay(&clocks);
-	let mut delay = dp.TIM5.delay_us(&clocks);
-
-	//let mut rtc = Rtc::new(dp.RTC, &mut dp.PWR);
-	//
-	//rtc.set_datetime(&PrimitiveDateTime::new(
-    //    date!(2022 - 02 - 07),
-    //    time!(23:59:50),
-    //)).unwrap();
-
-	let mut syscfg = dp.SYSCFG.constrain();
-
-	but.make_interrupt_source(&mut syscfg);
-    but.trigger_on_edge(&mut dp.EXTI, Edge::Falling);
-    but.enable_interrupt(&mut dp.EXTI);
-
-	let scl = gpiob.pb6;
-	let sda = gpiob.pb7;
-	let mut i2c = I2c::new(
-        dp.I2C1,
-        (scl, sda),
-        Mode::Standard {
-            frequency: 300.kHz(),
-        },
-        &clocks,
-    );
-
-	let tx_pin = gpioa.pa2.into_alternate();
+	//-------- UART
+	let uart_tx_pin = gpioa.pa2.into_alternate();
 	let mut uart_tx: serial::Tx<pac::USART2, u8> = dp.USART2.tx(
-        tx_pin,
+        uart_tx_pin,
         serial::config::Config::default()
             .baudrate(115200.bps())
             .wordlength_8()
             .parity_none(),
         &clocks,
     ).unwrap();
+	writeln!(&mut uart_tx, "UART is ready").unwrap();
 
+	//-------- On-module button irq
+	but.make_interrupt_source(&mut syscfg);
+    but.trigger_on_edge(&mut dp.EXTI, Edge::Falling);
+    but.enable_interrupt(&mut dp.EXTI);
 
-	unsafe {
-        cortex_m::peripheral::NVIC::unmask(Interrupt::TIM2);
-		cortex_m::peripheral::NVIC::unmask(but.interrupt());
-    }
-	
-	cortex_m::interrupt::free(|cs| *G_TIM.borrow(cs).borrow_mut() = Some(timer));
+	let scl = gpiob.pb8.into_open_drain_output();
+	let sda = gpiob.pb9.into_open_drain_output();
+	let i2c_inst = I2c::new(
+        dp.I2C1,
+        (scl, sda),
+        Mode::Standard {
+            frequency: 100.kHz(),
+        },
+        &clocks,
+    );
+
+	//-------- I2C display
+	let display_interface = I2CDisplayInterface::new(i2c_inst);
+	let mut displ = Ssd1306::new(display_interface, DisplaySize128x64, DisplayRotation::Rotate0)
+        .into_buffered_graphics_mode();
+    displ.init().unwrap();
+
+	let style_6x10 = MonoTextStyle::new(&FONT_6X10, BinaryColor::On);
+	let style_10x20 = MonoTextStyle::new(&FONT_10X20, BinaryColor::On);
+
+	//-------- Set global variables
+	let global_regs: u8 = 0x55; // TODO
+	cortex_m::interrupt::free(|cs| *G_REGS.borrow(cs).borrow_mut() = Some(global_regs));
+	cortex_m::interrupt::free(|cs| *G_TIM.borrow(cs).borrow_mut() = Some(timer2));
 	cortex_m::interrupt::free(|cs| *G_BUT.borrow(cs).borrow_mut() = Some(but));
 
+	//-------- Unmask IRQ
+	unmask_irq();
+
+	//--------------------------------------------------------------------------
+	
     loop {
-        //for _ in 0..100_000 {
-        //    led.set_high();
-        //}
-        //for _ in 0..100_000 {
-        //    led.set_low();
-        //}
-
-		//static mut REGS: Option<u8> = None;
-		//let r = REGS.get_or_insert_with(|| {
-		//	cortex_m::interrupt::free(|cs| {
-		//		// Move LED pin here, leaving a None in its place
-		//		G_REGS.borrow(cs).replace(None).unwrap()
-		//	})
-		//});
-
-		//cortex_m::interrupt::free(|cs| *G_REGS.borrow(cs).borrow_mut() = Some(11));
 		cortex_m::interrupt::free(|cs| {
 			if let Some(r) = G_REGS.borrow(cs).borrow_mut().as_mut() {
 				if *r != 0 {
-					led.set_low();
 					*r = 0;
-					//println!("a");
-					writeln!(uart_tx, "a").unwrap();
+					led.set_low();
+
+					let dt = rtc.get_datetime();
+					writeln!(uart_tx, "{}", dt).unwrap();
+
+					let mut buf = [0u8; 19];
+
+					uint_to_str10(dt.year() as u32, 4, &mut buf[0..4]);
+					uint_to_str10(dt.month() as u32, 2, &mut buf[5..7]);
+					uint_to_str10(dt.day() as u32, 2, &mut buf[8..10]);
+					uint_to_str10(dt.hour() as u32, 2, &mut buf[11..13]);
+					uint_to_str10(dt.minute() as u32, 2, &mut buf[14..16]);
+					uint_to_str10(dt.second() as u32, 2, &mut buf[17..19]);
+					buf[4] = b'-';
+					buf[7] = b'-';
+					buf[10] = b' ';
+					buf[13] = b':';
+					buf[16] = b':';
+					
+					displ.clear_buffer();
+					Text::new(
+						str::from_utf8(&buf[0..10]).unwrap(),
+						Point::new(0, 15),
+						style_10x20
+					).draw(&mut displ).unwrap();
+					Text::new(
+						str::from_utf8(&buf[11..19]).unwrap(),
+						Point::new(0, 30),
+						style_10x20
+					).draw(&mut displ).unwrap();
+					displ.flush().unwrap();
 				} else {
 					led.set_high();
-				}	
+					delay_t5.delay_ms(100_u32);
+				}
 			}
 		});
-		delay.delay_ms(100_u32);
     }
-}
-
-#[interrupt]
-fn TIM2() {
-    static mut TIM: Option<CounterUs<TIM2>> = None;
-
-    //let regs = REGS.get_or_insert_with(|| {
-    //    cortex_m::interrupt::free(|cs| {
-    //        // Move LED pin here, leaving a None in its place
-    //        G_REGS.borrow(cs).replace(None).unwrap()
-    //    })
-    //});
-
-	cortex_m::interrupt::free(|cs| {
-		if let Some(r) = G_REGS.borrow(cs).borrow_mut().as_mut() {
-			*r = 11;
-		}
-	});
-
-    let tim = TIM.get_or_insert_with(|| {
-        cortex_m::interrupt::free(|cs| {
-            // Move LED pin here, leaving a None in its place
-            G_TIM.borrow(cs).replace(None).unwrap()
-        })
-    });
-
-    let _ = tim.wait();
-}
-
-#[interrupt]
-fn EXTI0() {
-	cortex_m::interrupt::free(|cs| {
-		if let Some(r) = G_REGS.borrow(cs).borrow_mut().as_mut() {
-			*r = 11;
-		}
-	});
-	cortex_m::interrupt::free(|cs| {
-		if let Some(but) = G_BUT.borrow(cs).borrow_mut().as_mut() {
-			but.clear_interrupt_pending_bit();
-		}
-	});
-
 }
