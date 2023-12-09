@@ -3,7 +3,7 @@ use core::cell::RefCell;
 use cortex_m::interrupt::Mutex;
 use stm32f4xx_hal::{
 	pac::{interrupt, Interrupt, TIM2},
-	timer::CounterUs,
+	timer::{Event, CounterUs},
 	gpio::{self, ExtiPin},
 };
 
@@ -26,22 +26,16 @@ pub fn unmask_irq() {
 
 #[interrupt]
 fn TIM2() {
-    static mut TIM: Option<CounterUs<TIM2>> = None;
-
 	cortex_m::interrupt::free(|cs| {
 		if let Some(r) = G_REGS.borrow(cs).borrow_mut().as_mut() {
 			*r = 11;
 		}
 	});
 
-    let tim = TIM.get_or_insert_with(|| {
-        cortex_m::interrupt::free(|cs| {
-            // Move LED pin here, leaving a None in its place
-            G_TIM.borrow(cs).replace(None).unwrap()
-        })
-    });
-
-    let _ = tim.wait();
+    cortex_m::interrupt::free(|cs| {
+		let mut tim = G_TIM.borrow(cs).borrow_mut();
+		tim.as_mut().unwrap().clear_interrupt(Event::Update);
+	});
 }
 
 #[interrupt]
@@ -51,6 +45,7 @@ fn EXTI0() {
 			*r = 11;
 		}
 	});
+	
 	cortex_m::interrupt::free(|cs| {
 		if let Some(but) = G_BUT.borrow(cs).borrow_mut().as_mut() {
 			but.clear_interrupt_pending_bit();

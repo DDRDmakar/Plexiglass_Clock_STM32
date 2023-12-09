@@ -22,6 +22,12 @@ use stm32f4xx_hal::{
 	serial,
 };
 
+use shared_bus;
+use time::{
+    macros::{date, time},
+    PrimitiveDateTime,
+};
+
 use ssd1306::{prelude::*, I2CDisplayInterface, Ssd1306};
 use embedded_graphics::{
     prelude::*,
@@ -32,11 +38,7 @@ use embedded_graphics::{
 		iso_8859_5::{FONT_10X20, FONT_6X10},
 	},
 };
-
-use time::{
-    macros::{date, time},
-    PrimitiveDateTime,
-};
+use bmp280_ehal::{self, PowerMode, Standby, Filter, Oversampling};
 
 mod util;
 mod irq;
@@ -115,15 +117,30 @@ fn main() -> ! {
         },
         &clocks,
     );
-
+	let i2c_shared = shared_bus::BusManagerSimple::new(i2c_inst);
+	
 	//-------- I2C display
-	let display_interface = I2CDisplayInterface::new(i2c_inst);
+	let display_interface = I2CDisplayInterface::new(i2c_shared.acquire_i2c());
 	let mut displ = Ssd1306::new(display_interface, DisplaySize128x64, DisplayRotation::Rotate0)
         .into_buffered_graphics_mode();
     displ.init().unwrap();
 
 	let style_6x10 = MonoTextStyle::new(&FONT_6X10, BinaryColor::On);
 	let style_10x20 = MonoTextStyle::new(&FONT_10X20, BinaryColor::On);
+
+	//-------- Thermometer and barometer
+	let mut bmp = bmp280_ehal::BMP280::new(i2c_shared.acquire_i2c()).unwrap();
+	let mut bmp_control = bmp.control();
+	bmp.set_control(bmp280_ehal::Control {
+        osrs_t: Oversampling::x1,
+        osrs_p: Oversampling::x4,
+        mode: PowerMode::Normal,
+    });
+	bmp.reset();
+	bmp.set_config(bmp280_ehal::Config {
+        t_sb: Standby::ms250,
+        filter: Filter::c8,
+    });
 
 	//-------- Set global variables
 	let global_regs: u8 = 0x55; // TODO
@@ -135,8 +152,14 @@ fn main() -> ! {
 	unmask_irq();
 
 	//--------------------------------------------------------------------------
+
+	//let mut regs_copy: u8 = 0;
+	//cortex_m::interrupt::free(|cs| {
+	//	G_REGS.borrow(cs).replace(None).unwrap()
+	//});
 	
     loop {
+		
 		cortex_m::interrupt::free(|cs| {
 			if let Some(r) = G_REGS.borrow(cs).borrow_mut().as_mut() {
 				if *r != 0 {
@@ -144,7 +167,7 @@ fn main() -> ! {
 					led.set_low();
 
 					let dt = rtc.get_datetime();
-					writeln!(uart_tx, "{}", dt).unwrap();
+					write!(uart_tx, "{}\t", dt).unwrap();
 
 					let mut buf = [0u8; 19];
 
@@ -159,6 +182,15 @@ fn main() -> ! {
 					buf[10] = b' ';
 					buf[13] = b':';
 					buf[16] = b':';
+
+					let pressure = bmp.pressure();
+					let temperature = bmp.temp();
+					writeln!(uart_tx, "{} {}", pressure, temperature).unwrap();
+					bmp.set_control(bmp280_ehal::Control {
+						osrs_t: Oversampling::x1,
+						osrs_p: Oversampling::x4,
+						mode: PowerMode::Normal,
+					});
 					
 					displ.clear_buffer();
 					Text::new(
@@ -170,7 +202,7 @@ fn main() -> ! {
 						str::from_utf8(&buf[11..19]).unwrap(),
 						Point::new(0, 30),
 						style_10x20
-					).draw(&mut displ).unwrap();
+					).draw(&mut displ).unwrap();					
 					displ.flush().unwrap();
 				} else {
 					led.set_high();

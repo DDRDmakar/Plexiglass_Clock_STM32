@@ -8,9 +8,11 @@ edition = "2021"
 cortex-m = "0.7"
 cortex-m-rt = "0.7"
 panic-halt = "0.2.0"
+shared-bus = "0.3.1"
 
 embedded-graphics = "0.8.1"
 ssd1306 = "0.8.4"
+bmp280-ehal = "0.0.6"
 
 [dependencies.time]
 version = "0.3.30"
