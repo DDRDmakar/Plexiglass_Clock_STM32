@@ -13,6 +13,7 @@ shared-bus = "0.3.1"
 embedded-graphics = "0.8.1"
 ssd1306 = "0.8.4"
 bmp280-ehal = "0.0.6"
+rotary-encoder-embedded = "0.2.0"
 
 [dependencies.time]
 version = "0.3.30"
