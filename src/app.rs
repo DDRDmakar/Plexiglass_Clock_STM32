@@ -13,10 +13,11 @@ use stm32f4xx_hal::{
 };
 
 use shared_bus::{NullMutex, I2cProxy};
-//use time::{
-//	macros::{date, time},
-//	PrimitiveDateTime,
-//};
+use time::{
+	macros::{date, time},
+	PrimitiveDateTime,
+	Duration,
+};
 use ssd1306::{
 	prelude::*,
 	Ssd1306,
@@ -27,7 +28,7 @@ use embedded_graphics::{
 	pixelcolor::BinaryColor,
 	text::Text,
 	mono_font::MonoTextStyle,
-	primitives::{Rectangle, PrimitiveStyleBuilder},
+	primitives::{Rectangle, Circle, PrimitiveStyle, PrimitiveStyleBuilder},
 };
 use bmp280_ehal::{self, PowerMode, Oversampling};
 use rotary_encoder_embedded::{RotaryEncoder, Direction, standard::StandardMode};
@@ -36,7 +37,7 @@ use crate::irq::*;
 use crate::util::*;
 
 type OledDisplayType<'a> = Ssd1306<I2CInterface<I2cProxy<'a, NullMutex<I2c<pac::I2C1>>>>, DisplaySize128x64, BufferedGraphicsMode<DisplaySize128x64>>;
-type RotaryEncoderType = RotaryEncoder<StandardMode, Pin<'B', 12, Input>, Pin<'B', 13, Input>>;
+type RotaryEncoderType = RotaryEncoder<StandardMode, Pin<'B', 13, Input>, Pin<'B', 12, Input>>;
 type BMP280Type<'a> = bmp280_ehal::BMP280<I2cProxy<'a, NullMutex<I2c<pac::I2C1>>>>;
 
 pub const BMP_CONTROL: bmp280_ehal::Control = bmp280_ehal::Control {
@@ -44,6 +45,34 @@ pub const BMP_CONTROL: bmp280_ehal::Control = bmp280_ehal::Control {
 	osrs_p: Oversampling::x4,
 	mode: PowerMode::Forced,
 };
+
+const DATETIME_CURSOR_COORD: [(u8, u8); 14] = [
+	(10 * 0, 1 + 0), // Y
+	(10 * 1, 1 + 0), // Y
+	(10 * 2, 1 + 0), // Y
+	(10 * 3, 1 + 0), // Y
+	(10 * 5, 1 + 0), // M
+	(10 * 6, 1 + 0), // M
+	(10 * 8, 1 + 0), // D
+	(10 * 9, 1 + 0), // D
+	
+	(10 * 0, 1 + 20), // h
+	(10 * 1, 1 + 20), // h
+	(10 * 3, 1 + 20), // m
+	(10 * 4, 1 + 20), // m
+	(10 * 6, 1 + 20), // s
+	(10 * 7, 1 + 20), // s
+];
+
+enum State {
+	Idle,
+	SetTime,
+}
+
+enum CursorRole {
+	SelectDigit,
+	SetTime,
+}
 
 pub struct App<'a> {
 	rtc: Rtc,
@@ -56,9 +85,12 @@ pub struct App<'a> {
 	style_10x20: MonoTextStyle<'a, BinaryColor>,
 	bmp: BMP280Type<'a>,
 
+	state: State,
 	pressure: f32,
 	temperature: f32,
-	cursor_position: i8,
+	cursor_position: u8,
+	encoder_value: i8,
+	datetime: PrimitiveDateTime,
 }
 
 impl<'b> App<'b> {
@@ -83,23 +115,32 @@ impl<'b> App<'b> {
 			style_6x10,
 			style_10x20,
 			bmp,
+			state: State::Idle,
 			pressure: 0.0,
 			temperature: 0.0,
 			cursor_position: 0,
+			encoder_value: 0,
+			datetime: PrimitiveDateTime::new(
+				date!(1970-01-01),
+				time!(00:00:00),
+			),
 		}
 	}
 	
 	pub fn main_loop(&mut self) {
+		self.state = State::Idle;
 		let mut loop_ctr = 0_u32;
+		let mut cursor_role = CursorRole::SelectDigit;
+		let mut flags = 0_u8;
 		
 		loop {
 			loop_ctr += 1;
 
-			let mut r = 0_u8;
+			// Copy flags into local variable and clear
 			cortex_m::interrupt::free(|cs| {
-				if let Some(r_) = G_REGS.borrow(cs).borrow_mut().as_mut() {
-					r = *r_;
-					*r_ = 0;
+				if let Some(f) = G_FLAGS.borrow(cs).borrow_mut().as_mut() {
+					flags |= *f;
+					*f = 0;
 				}
 			});
 
@@ -111,31 +152,75 @@ impl<'b> App<'b> {
 				writeln!(self.uart_tx, "Update temp").unwrap();
 			}
 
-			if r != 0 /*|| encoder_result != 0*/ {
-				self.led.set_low();
-				self.display_main_screen();
-				self.draw_cursor();
-				self.led.set_high();
-			}
-
 			self.rotary_encoder.update();
 			match self.rotary_encoder.direction() {
 				Direction::Clockwise => {
-					self.cursor_position += 1;
-					self.draw_cursor();
+					self.encoder_value = self.encoder_value.saturating_add(1);
 				}
 				Direction::Anticlockwise => {
-					self.cursor_position -= 1;
-					self.draw_cursor();
+					self.encoder_value = self.encoder_value.saturating_sub(1);
 				}
 				Direction::None => { }
 			}
 
+			match self.state {
+				State::Idle => {
+					if flags & FLAG_TIMER_1S != 0 {
+						flags &= !FLAG_TIMER_1S;
+						self.led.set_low();
+						self.display_screen_main();
+						self.displ.flush().unwrap();
+						self.led.set_high();
+					}
+					else if flags & FLAG_ENCODER_PRESSED != 0 {
+						flags &= !FLAG_ENCODER_PRESSED;
+						self.state = State::SetTime;
+						self.datetime = self.rtc.get_datetime();
+						self.display_screen_set_time();
+						self.displ.flush().unwrap();
+						// Clear button flag cause it's a return condition from State::SetTime
+						flags &= !FLAG_BUTTON_PRESSED;
+						self.encoder_value = 0;
+					}
+				},
+				State::SetTime => {
+					if flags & FLAG_BUTTON_PRESSED != 0 {
+						flags &= !FLAG_BUTTON_PRESSED;
+						self.state = State::Idle;
+					}
+					else if self.encoder_value != 0 {
+						match cursor_role {
+							CursorRole::SelectDigit => {
+								self.cursor_position = self.cursor_position.saturating_add_signed(self.encoder_value);
+								self.cursor_position = if self.cursor_position > 13 { 13 } else { self.cursor_position };
+								self.display_screen_set_time();
+								self.draw_cursor();
+								self.displ.flush().unwrap();
+
+								if flags & FLAG_ENCODER_PRESSED != 0 { cursor_role = CursorRole::SetTime; }
+								flags &= !FLAG_ENCODER_PRESSED;
+							},
+							CursorRole::SetTime => {
+								//self.change_time();
+								self.datetime = self.datetime.saturating_add(Duration::days(1));
+								self.display_screen_set_time();
+								self.draw_cursor();
+								self.displ.flush().unwrap();
+
+								if flags & FLAG_ENCODER_PRESSED != 0 { cursor_role = CursorRole::SelectDigit; }
+								flags &= !FLAG_ENCODER_PRESSED;
+							},
+						}
+						self.encoder_value = 0;
+					}
+				},
+			}
+			
 			self.delay_t5.delay_ms(1_u32);
 		}
 	}
 
-	pub fn display_main_screen(&mut self) {
+	pub fn display_screen_main(&mut self) {
 		let dt = self.rtc.get_datetime();
 		writeln!(self.uart_tx, "{} {:.2} {:.2}\t", dt, self.temperature, self.pressure).unwrap();
 
@@ -161,7 +246,7 @@ impl<'b> App<'b> {
 		).draw(&mut self.displ).unwrap();
 		Text::new(
 			str::from_utf8(&buf[11..19]).unwrap(),
-			Point::new(0, 30),
+			Point::new(0, 35),
 			self.style_10x20
 		).draw(&mut self.displ).unwrap();
 
@@ -177,9 +262,12 @@ impl<'b> App<'b> {
 		buf[6] = b'C';
 		Text::new(
 			str::from_utf8(&buf[0..7]).unwrap(),
-			Point::new(0, 40),
+			Point::new(70, 50),
 			self.style_6x10
 		).draw(&mut self.displ).unwrap();
+		Circle::new(Point::new(70 + (6 * 5) + 1, 42), 4)
+			.into_styled(PrimitiveStyle::with_stroke(BinaryColor::On, 1))
+			.draw(&mut self.displ).unwrap();
 
 		uint_to_str10(round_f32_i32(self.pressure) as u32, 6, &mut buf[0..6], false);
 		buf[6] = b' ';
@@ -202,8 +290,36 @@ impl<'b> App<'b> {
 			Point::new(0, 60),
 			self.style_6x10
 		).draw(&mut self.displ).unwrap();
+	}
+
+	pub fn display_screen_set_time(&mut self) {
+		let dt = self.datetime;
 		
-		self.displ.flush().unwrap();
+		self.displ.clear_buffer();
+
+		let mut buf = [0u8; 19];
+		uint_to_str10(dt.year() as u32, 4, &mut buf[0..4], true);
+		uint_to_str10(dt.month() as u32, 2, &mut buf[5..7], true);
+		uint_to_str10(dt.day() as u32, 2, &mut buf[8..10], true);
+		uint_to_str10(dt.hour() as u32, 2, &mut buf[11..13], false);
+		uint_to_str10(dt.minute() as u32, 2, &mut buf[14..16], true);
+		uint_to_str10(dt.second() as u32, 2, &mut buf[17..19], true);
+		buf[4] = b'-';
+		buf[7] = b'-';
+		buf[10] = b' ';
+		buf[13] = b':';
+		buf[16] = b':';
+
+		Text::new(
+			str::from_utf8(&buf[0..10]).unwrap(),
+			Point::new(0, 15),
+			self.style_10x20
+		).draw(&mut self.displ).unwrap();
+		Text::new(
+			str::from_utf8(&buf[11..19]).unwrap(),
+			Point::new(0, 35),
+			self.style_10x20
+		).draw(&mut self.displ).unwrap();
 	}
 
 	fn draw_cursor(&mut self) {
@@ -212,9 +328,13 @@ impl<'b> App<'b> {
 			.stroke_width(1)
 			//.fill_color(BinaryColor::Off)
 			.build();
-		Rectangle::new(Point::new(60 + 10 * self.cursor_position as i32, 40), Size::new(10, 20))
+		Rectangle::new(
+			Point::new(
+				DATETIME_CURSOR_COORD[self.cursor_position as usize].0.into(),
+				DATETIME_CURSOR_COORD[self.cursor_position as usize].1.into()
+			),
+			Size::new(10, 17))
 			.into_styled(rectangle_style)
 			.draw(&mut self.displ).unwrap();
-		self.displ.flush().unwrap();
 	}
 }

@@ -121,12 +121,16 @@ fn main() -> ! {
 	let i2c_shared = shared_bus::BusManagerSimple::new(i2c_inst);
 
 	//-------- Rotary encoder
-	let pin_s1 = gpiob.pb12.into_pull_up_input();
-	let pin_s2 = gpiob.pb13.into_pull_up_input();
+	let pin_s1 = gpiob.pb13.into_pull_up_input();
+	let pin_s2 = gpiob.pb12.into_pull_up_input();
 	let rotary_encoder = RotaryEncoder::new(
 		pin_s1,
 		pin_s2,
 	).into_standard_mode();
+	let mut encoder_pb = gpioa.pa1.into_pull_up_input(); // Encoder push button
+	encoder_pb.make_interrupt_source(&mut syscfg);
+	encoder_pb.trigger_on_edge(&mut dp.EXTI, Edge::Falling);
+	encoder_pb.enable_interrupt(&mut dp.EXTI);
 	
 	//-------- I2C display
 	let display_interface = I2CDisplayInterface::new(i2c_shared.acquire_i2c());
@@ -147,11 +151,11 @@ fn main() -> ! {
 	});
 
 	//-------- Set global variables
-	let global_regs: u8 = 0x55; // TODO
-	cortex_m::interrupt::free(|cs| *G_REGS.borrow(cs).borrow_mut() = Some(global_regs));
+	cortex_m::interrupt::free(|cs| *G_FLAGS.borrow(cs).borrow_mut() = Some(0x00));
 	cortex_m::interrupt::free(|cs| *G_TIM.borrow(cs).borrow_mut() = Some(timer2));
 	//cortex_m::interrupt::free(|cs| *G_TIM.borrow(cs).borrow_mut() = Some(timer3));
 	cortex_m::interrupt::free(|cs| *G_BUT.borrow(cs).borrow_mut() = Some(but));
+	cortex_m::interrupt::free(|cs| *G_ENCODER_PB.borrow(cs).borrow_mut() = Some(encoder_pb));
 
 	//-------- Unmask IRQ
 	unmask_irq();
@@ -169,11 +173,6 @@ fn main() -> ! {
 		style_10x20,
 		bmp,
 	);
-	
-	//let mut regs_copy: u8 = 0;
-	//cortex_m::interrupt::free(|cs| {
-	//	G_REGS.borrow(cs).replace(None).unwrap()
-	//});
 
 	loop {
 		appobj.main_loop();
